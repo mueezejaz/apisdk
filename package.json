@@ -1,0 +1,32 @@
+{
+  "name": "aisdk",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "dashboard": "tsx src/gemini-lb-provider/dashboard/main.ts",
+    "typecheck": "tsc --noEmit",
+    "build": "tsc",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@ai-sdk/google": "^4.0.63",
+    "@ai-sdk/provider": "^4.0.10",
+    "@ai-sdk/provider-utils": "^5.0.36",
+    "@types/node": "^26.4.1",
+    "ai": "^7.0.92",
+    "cheerio": "^1.2.0",
+    "dotenv": "^18.0.3",
+    "express": "^5.2.1",
+    "ioredis": "^6.0.0",
+    "typescript": "^7.0.2"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "tsx": "^4.23.15"
+  }
+}
