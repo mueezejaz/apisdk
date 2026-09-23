@@ -8,7 +8,10 @@
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
-    "noEmit": true
+    "noEmit": true,
+    "paths": {
+      "gemini-lb": ["./packages/gemini-lb/src/index.ts"]
+    }
   },
   "include": ["dashboard/**/*", "test/**/*"],
   "exclude": ["node_modules", "dist", "packages", "test/result.ts"]
