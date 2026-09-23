@@ -2,17 +2,17 @@ import express, { NextFunction, Request, Response } from 'express';
 import { createHash, randomBytes, timingSafeEqual } from 'crypto';
 import type { Server } from 'http';
 import Redis from 'ioredis';
-import { createRedis } from '../redis';
 import {
+  createRedis,
   KeyStore,
   maskKey,
   normalizeModels,
   DEFAULT_MAX_PER_MINUTE,
   DEFAULT_MAX_PER_DAY,
+  KeyErrorLog,
+  GeminiRateLimiter,
   type StoredKey,
-} from '../key-store';
-import { KeyErrorLog } from '../error-log';
-import { GeminiRateLimiter } from '../rate-limiter';
+} from 'gemini-lb';
 import { DASHBOARD_HTML } from './html';
 
 export interface DashboardOptions {
@@ -305,9 +305,13 @@ export async function startDashboard(
   });
 
   // ── Listen ────────────────────────────────────────────────────────────
+  // NOTE: don't pass the callback to app.listen() — Express also invokes it
+  // on 'error' (e.g. EADDRINUSE), which would resolve with a non-listening
+  // server and hide the real error. Use the events directly instead.
   const server: Server = await new Promise((resolve, reject) => {
-    const s = app.listen(port, host, () => resolve(s));
-    s.on('error', reject);
+    const s = app.listen(port, host);
+    s.once('listening', () => resolve(s));
+    s.once('error', reject);
   });
 
   const actualPort = (server.address() as { port: number }).port;

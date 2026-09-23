@@ -1,29 +1,35 @@
 import Redis from 'ioredis';
 import { ProviderV4 } from '@ai-sdk/provider';
 import { createRedis } from './redis';
-import { KeyStore, StoredModel, DEFAULT_MAX_PER_MINUTE, DEFAULT_MAX_PER_DAY } from './key-store';
+import {
+  KeyStore,
+  StoredModel,
+  DEFAULT_MAX_PER_MINUTE,
+  DEFAULT_MAX_PER_DAY,
+} from './key-store';
 import { KeyErrorLog } from './error-log';
-import { GeminiRateLimiter } from './rate-limiter';
+import { GeminiRateLimiter, KeyStats, RequestLog } from './rate-limiter';
 import { KeySelector } from './key-selector';
 import { GeminiLBLanguageModel } from './gemini-lb-language-model';
+import { GeminiRawClient, RawGenerateOptions, RawGenerateResult } from './raw';
 
 export interface GeminiLBProviderSettings {
   /**
    * Seed API keys — persisted to Redis on first run (never overwrites
-   * keys already stored there). Seeded keys get `models` below as their
-   * model config. Once seeded, manage everything via the dashboard.
+   * keys already stored there). Once seeded, manage keys in Redis
+   * directly; this option becomes optional.
    */
   keys?: string[];
 
   /**
-   * Redis connection URL or instance.
+   * Redis connection URL or instance. Keys and rate-limit state live here.
    */
   redisUrl?: string;
   redis?: Redis;
 
   /**
-   * Models assigned to seeded keys, and the fallback model order for
-   * 'auto' mode. Each key's own model config (dashboard) takes priority.
+   * Fallback models (also used to seed keys and order 'auto' mode).
+   * Each key's own model config in Redis takes priority.
    * @default ['gemini-3.1-flash-lite', 'gemini-3.5-flash-lite']
    */
   models?: string[];
@@ -69,10 +75,28 @@ export interface GeminiLBProviderSettings {
   name?: string;
 }
 
-interface GeminiLBProvider extends ProviderV4 {
+export interface GeminiLBProvider extends ProviderV4 {
   (modelId: string): GeminiLBLanguageModel;
   languageModel(modelId: string): GeminiLBLanguageModel;
   chat(modelId: string): GeminiLBLanguageModel;
+
+  /**
+   * Direct Gemini API call (no AI SDK needed): picks a key+model slot,
+   * calls generateContent, releases the slot and retries on 429.
+   *
+   *   const res = await lb.generate({ prompt: 'Hi' });   // model: 'auto'
+   *   res.text; res.model; res.keyId; res.raw;
+   */
+  generate(options: RawGenerateOptions): Promise<RawGenerateResult>;
+
+  /** Per-key / per-model usage stats (read from Redis). */
+  getStats(): Promise<KeyStats[]>;
+  /** In-memory request log of this process. */
+  getRequestLog(): RequestLog[];
+  /** The Redis-backed key store (list/add/update/remove keys). */
+  getKeyStore(): KeyStore;
+  /** Close the Redis connection if this provider created it. */
+  disconnect(): Promise<void>;
 }
 
 export function createGeminiLB(
@@ -108,20 +132,6 @@ export function createGeminiLB(
   });
   const errorLog = new KeyErrorLog(redis);
 
-  // Publish defaults so the dashboard can prefill its add-key form
-  // (and show the same fallback limits for legacy/seeded keys).
-  void redis
-    .set(
-      'gemini-lb:config',
-      JSON.stringify({
-        models: defaultModelIds,
-        maxPerMinute,
-        maxPerDay,
-        windowMs: settings.windowMs ?? 60_000,
-      }),
-    )
-    .catch(() => {});
-
   const rateLimiter = new GeminiRateLimiter({
     redis,
     keyStore,
@@ -132,6 +142,13 @@ export function createGeminiLB(
   const keySelector = new KeySelector({
     rateLimiter,
     maxRetries: settings.maxRetries,
+  });
+
+  const rawClient = new GeminiRawClient({
+    keySelector,
+    errorLog,
+    fetch: settings.fetch,
+    defaultHeaders: settings.headers,
   });
 
   const providerName = settings.name ?? 'gemini-lb';
@@ -157,13 +174,11 @@ export function createGeminiLB(
 
   provider.languageModel = createModel;
   provider.chat = createModel;
-
-  // Attach utility methods
-  (provider as any).getStats = () => rateLimiter.getStats();
-  (provider as any).getRequestLog = () => rateLimiter.getRequestLog();
-  (provider as any).getErrors = () => errorLog;
-  (provider as any).getKeyStore = () => keyStore;
-  (provider as any).disconnect = async () => {
+  provider.generate = (options) => rawClient.generate(options);
+  provider.getStats = () => rateLimiter.getStats();
+  provider.getRequestLog = () => rateLimiter.getRequestLog();
+  provider.getKeyStore = () => keyStore;
+  provider.disconnect = async () => {
     if (ownRedis) {
       await redis.quit();
     }

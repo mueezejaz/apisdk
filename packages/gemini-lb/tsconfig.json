@@ -3,13 +3,17 @@
     "target": "ES2022",
     "module": "commonjs",
     "lib": ["ES2022"],
+    "outDir": "./dist",
+    "rootDir": "./src",
     "strict": true,
     "esModuleInterop": true,
     "skipLibCheck": true,
     "forceConsistentCasingInFileNames": true,
     "resolveJsonModule": true,
-    "noEmit": true
+    "declaration": true,
+    "declarationMap": true,
+    "sourceMap": true
   },
-  "include": ["dashboard/**/*", "test/**/*"],
-  "exclude": ["node_modules", "dist", "packages", "test/result.ts"]
+  "include": ["src/**/*"],
+  "exclude": ["node_modules", "dist"]
 }

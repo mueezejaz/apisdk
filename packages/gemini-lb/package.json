@@ -1,0 +1,44 @@
+{
+  "name": "gemini-lb",
+  "version": "0.1.0",
+  "description": "Load-balanced Gemini client: Redis-backed API keys with per-model rate limits, retry on 429, Vercel AI SDK provider + raw API calls.",
+  "keywords": [
+    "gemini",
+    "google",
+    "ai-sdk",
+    "vercel-ai",
+    "load-balancer",
+    "rate-limit",
+    "redis"
+  ],
+  "author": "mueezejaz",
+  "license": "ISC",
+  "type": "commonjs",
+  "main": "./src/index.ts",
+  "types": "./src/index.ts",
+  "files": [
+    "src",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@ai-sdk/google": "^4.0.63",
+    "@ai-sdk/provider": "^4.0.10",
+    "ioredis": "^6.0.0"
+  },
+  "peerDependencies": {
+    "ai": ">=4.0.0"
+  },
+  "peerDependenciesMeta": {
+    "ai": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.1",
+    "typescript": "^7.0.2"
+  }
+}
