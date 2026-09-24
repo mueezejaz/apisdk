@@ -407,7 +407,7 @@ function printStats(stats: KeyStats[]) {
   for (const s of stats) {
     const minBar = '█'.repeat(s.minuteUsed) + '░'.repeat(s.minuteRemaining);
     const dayBar = '█'.repeat(Math.min(s.dayUsed, 20)) + '░'.repeat(Math.min(s.dayRemaining, 20));
-    console.log(`  Key ${s.keyIndex} (${s.maskedKey}) | ${PROVIDER_LABELS[s.provider] ?? s.provider} | ${s.model}`);
+    console.log(`  Key ${s.keyIndex} (${s.maskedKey}) | ${s.backup ? 'BACKUP' : 'PRIMARY'} | ${PROVIDER_LABELS[s.provider] ?? s.provider} | ${s.model}`);
     if (s.baseUrl) console.log(`    base URL: ${s.baseUrl}`);
     console.log(`    1-min: [${minBar}] ${s.minuteUsed}/${s.minuteUsed + s.minuteRemaining}`);
     console.log(`    daily: [${dayBar}] ${s.dayUsed}/${s.dayUsed + s.dayRemaining}`);
@@ -424,7 +424,7 @@ function printLog(log: RequestLog[]) {
   for (const entry of recent) {
     const time = new Date(entry.timestamp).toLocaleTimeString();
     const icon = entry.action === 'claimed' ? '✓' : entry.action === 'released' ? '✗' : '⚠';
-    console.log(`  ${icon} ${time} | Key ${entry.keyIndex} (${entry.maskedKey}) | ${entry.model}`);
+    console.log(`  ${icon} ${time} | Key ${entry.keyIndex} (${entry.maskedKey}) | ${entry.backup ? 'BACKUP' : 'PRIMARY'} | ${entry.model}`);
   }
   console.log('');
 }
@@ -496,7 +496,7 @@ async function handleRaw(promptText: string) {
     const res = await lb.generate({ model: activeModel, prompt: promptText });
     stop();
     console.log(`\n${res.text}`);
-    console.log(`\n  ⚡ raw call · provider=${res.provider} · model=${res.model} · key=${res.keyId}\n`);
+    console.log(`\n  ⚡ raw call · provider=${res.provider} · model=${res.model} · backup=${res.backup} · key=${res.keyId}\n`);
   } catch (error: any) {
     stop();
     console.error(`\n  Error: ${error.message}\n`);
@@ -507,6 +507,7 @@ type ModelCatalogEntry = {
   id: string;
   providers: Set<string>;
   baseUrls: Set<string>;
+  backup: boolean;
 };
 
 async function getModelCatalog(): Promise<ModelCatalogEntry[]> {
@@ -527,8 +528,10 @@ async function getModelCatalog(): Promise<ModelCatalogEntry[]> {
           id: model.id,
           providers: new Set<string>(),
           baseUrls: new Set<string>(),
+          backup: false,
         };
         entry.providers.add(provider);
+        entry.backup = entry.backup || key.backup === true;
         if (key.baseUrl) entry.baseUrls.add(key.baseUrl);
         catalog.set(model.id, entry);
       }
@@ -539,7 +542,7 @@ async function getModelCatalog(): Promise<ModelCatalogEntry[]> {
 
   if (catalog.size === 0) {
     for (const id of DEFAULT_DISPLAY_MODELS) {
-      catalog.set(id, { id, providers: new Set(), baseUrls: new Set() });
+      catalog.set(id, { id, providers: new Set(), baseUrls: new Set(), backup: false });
     }
   }
   return [...catalog.values()];
@@ -552,7 +555,7 @@ async function printModels(): Promise<void> {
     const providers = model.providers.size > 0
       ? [...model.providers].map((p) => PROVIDER_LABELS[p] ?? p).join(', ')
       : 'not configured';
-    console.log(`  ${model.id}  [${providers}]`);
+    console.log(`  ${model.id}  [${model.backup ? 'BACKUP · ' : ''}${providers}]`);
     for (const baseUrl of model.baseUrls) console.log(`    ${baseUrl}`);
   }
   console.log(`\n  Active model: ${activeModel}`);
@@ -563,10 +566,12 @@ async function printBanner() {
   let keyCount = 0;
   const catalog = await getModelCatalog();
   const providerNames = new Set<string>();
+  let backupCount = 0;
 
   try {
     const keys = await lb.getKeyStore().list();
     keyCount = keys.filter((key) => key.enabled).length;
+    backupCount = keys.filter((key) => key.enabled && key.backup).length;
     for (const key of keys) {
       if (key.enabled) providerNames.add(key.provider ?? 'google');
     }
@@ -576,7 +581,7 @@ async function printBanner() {
 
   const enabled = keyCount === 0
     ? '⚠ no enabled keys in Redis — add one in the dashboard'
-    : `${keyCount} key${keyCount === 1 ? '' : 's'} · ${catalog.length} model${catalog.length === 1 ? '' : 's'} · ${[...providerNames].map((p) => PROVIDER_LABELS[p] ?? p).join(' + ') || 'provider unknown'}`;
+    : `${keyCount} key${keyCount === 1 ? '' : 's'} · ${backupCount} backup · ${catalog.length} model${catalog.length === 1 ? '' : 's'} · ${[...providerNames].map((p) => PROVIDER_LABELS[p] ?? p).join(' + ') || 'provider unknown'}`;
 
   console.log('\x1b[1m');
   console.log('  ╔══════════════════════════════════════╗');

@@ -25,11 +25,11 @@ async function main(): Promise<void> {
 
   try {
     const keys = (await keyStore.list()).filter(
-      (key) => key.enabled && key.provider === 'tokenharbor',
+      (key) => key.enabled && key.provider === 'tokenharbor' && !key.backup,
     );
     if (keys.length === 0) {
       throw new Error(
-        'No enabled Token Harbor key found. Add one in the dashboard first.',
+        'No enabled primary Token Harbor key found. Add/enable one in the dashboard first.',
       );
     }
 
@@ -51,6 +51,7 @@ async function main(): Promise<void> {
           model: result.model,
           key: maskKey(selected.key.key),
           keyId: result.keyId,
+          backup: result.backup,
           baseUrl: selected.key.baseUrl,
         },
         null,

@@ -32,6 +32,9 @@ export interface GeminiLBProviderSettings {
   /** Base URL assigned to seeded Token Harbor keys. @default Token Harbor /v1 */
   defaultBaseUrl?: string;
 
+  /** Mark seeded keys as backup-only keys. @default false */
+  defaultBackup?: boolean;
+
   /**
    * Redis connection URL or instance. Keys and rate-limit state live here.
    */
@@ -68,6 +71,12 @@ export interface GeminiLBProviderSettings {
    * @default 3
    */
   maxRetries?: number;
+
+  /**
+   * How long a failed key is quarantined before it can be selected again.
+   * @default 20000 (20 seconds)
+   */
+  cooldownMs?: number;
 
   /**
    * Custom headers to include in requests.
@@ -146,6 +155,7 @@ export function createGeminiLB(
     defaultModels: fallbackModels,
     defaultProvider,
     defaultBaseUrl,
+    defaultBackup: settings.defaultBackup,
   });
   const errorLog = new KeyErrorLog(redis);
 
@@ -159,6 +169,7 @@ export function createGeminiLB(
   const keySelector = new KeySelector({
     rateLimiter,
     maxRetries: settings.maxRetries,
+    cooldownMs: settings.cooldownMs,
   });
 
   const rawClient = new GeminiRawClient({

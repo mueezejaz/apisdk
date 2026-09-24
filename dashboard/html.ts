@@ -63,6 +63,9 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
   .proj-chip { background: #30363d; color: var(--muted); border-radius: 10px; padding: 1px 9px; font-size: 12px; }
   .provider-chip { background: #8957e533; color: #d2a8ff; border-radius: 10px; padding: 1px 9px; font-size: 12px; }
   .provider-chip.google { background: #1f6feb33; color: var(--accent); }
+  .backup-chip { background: #d2992222; color: var(--yellow); border: 1px solid #d2992255; border-radius: 10px; padding: 1px 9px; font-size: 12px; }
+  .backup-option { display: flex; align-items: center; gap: 7px; color: var(--muted); font-size: 12px; margin: 8px 0; cursor: pointer; }
+  .backup-option input { accent-color: var(--yellow); }
   .base-url-chip {
     max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
     font-family: ui-monospace, Consolas, monospace; font-size: 11px; color: var(--muted);
@@ -99,6 +102,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
   .slider:before { content: ""; position: absolute; width: 14px; height: 14px; left: 3px; top: 3px; background: #8b949e; border-radius: 50%; transition: .2s; }
   .switch input:checked + .slider { background: #238636; }
   .switch input:checked + .slider:before { transform: translateX(16px); background: #fff; }
+  .switch.backup input:checked + .slider { background: #8957e5; }
   .empty { text-align: center; color: var(--muted); padding: 40px 0; }
   .toast { position: fixed; bottom: 20px; right: 20px; background: var(--panel); border: 1px solid var(--border); border-radius: 6px; padding: 10px 16px; display: none; z-index: 10; }
   .toast.show { display: block; }
@@ -156,6 +160,11 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
         </div>
         <input type="text" id="add-key" placeholder="AIza… API key *" autocomplete="off">
       </div>
+
+      <label class="backup-option">
+        <input type="checkbox" id="add-backup">
+        Use this key as backup only after a primary key fails (primary cooldown: 20s)
+      </label>
 
       <div class="models-box">
         <div class="model-row" style="margin-bottom:6px">
@@ -403,6 +412,11 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       '</div>';
   }
 
+  function cooldownText(until) {
+    var seconds = until ? Math.max(0, Math.ceil((until - Date.now()) / 1000)) : 0;
+    return seconds > 0 ? "cooling down " + seconds + "s" : "";
+  }
+
   function errChip(status) {
     var cls = "egray";
     var txt = status ? String(status) : "ERR";
@@ -424,6 +438,8 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       '<input type="url" class="ed-base-url" placeholder="Base URL" value="' + esc(baseUrl) + '" autocomplete="off">' +
       '</div>';
     h += '<div style="margin-top:8px"><input type="text" class="ed-key" placeholder="rotate key — leave blank to keep current" autocomplete="off"></div>';
+    h += '<label class="backup-option"><input type="checkbox" class="ed-backup"' +
+      (k.backup ? ' checked' : '') + '> Use as backup key</label>';
     h += '<div class="models-box" style="margin-top:8px">' +
       '<div class="model-row" style="margin-bottom:6px">' +
       '<span class="hdr" style="text-align:left">Model ID</span>' +
@@ -440,13 +456,16 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
     return h;
   }
 
-  function cardHtml(k, stats, errors) {
+  function cardHtml(k, stats, errors, cooldownUntil) {
     var h = '<div class="card' + (k.enabled ? "" : " disabled") + '" data-id="' + k.id + '">';
 
     h += '<div class="card-head">';
     h += '<span class="key-id">' + esc(k.masked) + '</span>';
     h += '<span class="provider-chip ' + (k.provider === "tokenharbor" ? "tokenharbor" : "google") + '">' +
       esc(providerLabel(k.provider || "google")) + '</span>';
+    if (k.backup) h += '<span class="backup-chip">Backup</span>';
+    var cooldown = cooldownText(cooldownUntil);
+    if (cooldown) h += '<span class="backup-chip">' + esc(cooldown) + '</span>';
     if (k.account) h += '<span class="acct-chip">' + esc(k.account) + '</span>';
     if (k.project) h += '<span class="proj-chip">' + esc(k.project) + '</span>';
     if (k.baseUrl) {
@@ -461,6 +480,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       h += '<span class="err-badge none">no errors</span>';
     }
 
+    h += '<label class="switch backup" title="Use as backup key"><input type="checkbox" data-act="backup"' + (k.backup ? " checked" : "") + '><span class="slider"></span></label>';
     h += '<label class="switch" title="Enable / disable"><input type="checkbox" data-act="toggle"' + (k.enabled ? " checked" : "") + '><span class="slider"></span></label>';
     h += '<button data-act="edit">Edit</button>';
     h += '<button class="danger" data-act="del">Delete</button>';
@@ -523,7 +543,12 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
           ' <span class="proj">/ ' + esc(k.project || "unassigned") + '</span></div>';
         lastGroup = group;
       }
-      html += cardHtml(k, byKey[k.id] || [], (data.errors || {})[k.id] || []);
+      html += cardHtml(
+        k,
+        byKey[k.id] || [],
+        (data.errors || {})[k.id] || [],
+        (data.cooldowns || {})[k.id],
+      );
     });
     el.innerHTML = html;
 
@@ -557,6 +582,11 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
             .then(function () { refresh(); })
             .catch(function (e) { toast(e.message, true); refresh(); });
         };
+        if (act === "backup") handler = function () {
+          req("/api/keys/" + id, { method: "PATCH", body: JSON.stringify({ backup: elm.checked }) })
+            .then(function () { refresh(); })
+            .catch(function (e) { toast(e.message, true); refresh(); });
+        };
         if (act === "del") handler = function () {
           if (!confirm("Delete this key? Its usage stats and errors will be removed.")) return;
           req("/api/keys/" + id, { method: "DELETE" })
@@ -578,7 +608,14 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
           if (!baseUrl) { toast("Base URL is required", true); return; }
           if (models.length === 0) { toast("At least one model with an ID is required", true); return; }
 
-          var patch = { account: account, project: project, provider: provider, baseUrl: baseUrl, models: models };
+          var patch = {
+            account: account,
+            project: project,
+            provider: provider,
+            baseUrl: baseUrl,
+            backup: card.querySelector(".ed-backup").checked,
+            models: models
+          };
           var newKey = card.querySelector(".ed-key").value.trim();
           if (newKey) patch.key = newKey;
 
@@ -588,7 +625,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
         };
 
         if (handler) {
-          if (act === "toggle") elm.addEventListener("change", handler);
+          if (act === "toggle" || act === "backup") elm.addEventListener("change", handler);
           else elm.addEventListener("click", handler);
         }
       });
@@ -737,6 +774,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
           project: project,
           provider: provider,
           baseUrl: baseUrl,
+          backup: document.getElementById("add-backup").checked,
           key: key,
           models: models
         })

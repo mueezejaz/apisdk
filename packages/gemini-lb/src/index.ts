@@ -21,6 +21,7 @@ export {
   maskKey,
   DEFAULT_MAX_PER_MINUTE,
   DEFAULT_MAX_PER_DAY,
+  DEFAULT_KEY_COOLDOWN_MS,
   type StoredKey,
   type StoredModel,
   type KeyStoreOptions,

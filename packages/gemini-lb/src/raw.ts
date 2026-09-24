@@ -32,6 +32,8 @@ export interface RawGenerateResult {
   keyId: string;
   /** Upstream provider that served the request. */
   provider: Provider;
+  /** True when the request was served by a backup key. */
+  backup: boolean;
   /** Full provider API response. */
   raw: Record<string, unknown>;
 }
@@ -163,22 +165,9 @@ export class GeminiRawClient {
 
   async generate(options: RawGenerateOptions): Promise<RawGenerateResult> {
     const requestedModel = options.model ?? 'auto';
-    let lastError: unknown;
-    const triedSlots = new Set<string>();
-
-    for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-      const slot = triedSlots.size === 0
-        ? await this.keySelector.select(requestedModel)
-        : await this.keySelector.select(requestedModel, triedSlots);
-      if (!slot) {
-        if (lastError) throw lastError;
-        throw new Error(
-          `[gemini-lb] All API keys exhausted for model "${requestedModel}". ` +
-            `Try again later or add more keys.`,
-        );
-      }
-
-      try {
+    return this.keySelector.executeWithFailover(
+      requestedModel,
+      async (slot) => {
         const doFetch = this.fetch ?? globalThis.fetch;
         const isTokenHarbor = slot.provider === 'tokenharbor';
         const baseUrl = slot.baseUrl ?? (isTokenHarbor ? TOKEN_HARBOR_BASE_URL : GOOGLE_BASE_URL);
@@ -229,30 +218,26 @@ export class GeminiRawClient {
           model: slot.model,
           keyId: slot.keyId,
           provider: slot.provider ?? 'google',
+          backup: slot.backup === true,
           raw,
         };
-      } catch (error) {
-        triedSlots.add(`${slot.keyId}\u0000${slot.model}`);
-        lastError = error;
-        // Fire-and-forget (record() never throws)
-        void this.errorLog?.record(slot.keyId, {
-          status:
-            error instanceof GeminiHTTPError
-              ? error.status
-              : undefined,
-          message: error instanceof Error ? error.message : String(error),
-          model: slot.model,
-        });
-        // Free the minute slot so another key can be tried
-        await this.keySelector.release(slot);
-
-        const status =
-          error instanceof GeminiHTTPError ? error.status : undefined;
-        if (status !== 429) throw error; // non-rate-limit error — don't retry
-        if (attempt === this.maxRetries) throw error;
-      }
-    }
-
-    throw lastError;
+      },
+      {
+        maxRetries: this.maxRetries,
+        onFailure: (slot, error) => {
+          // Fire-and-forget (record() never throws)
+          void this.errorLog?.record(slot.keyId, {
+            status:
+              error instanceof GeminiHTTPError
+                ? error.status
+                : undefined,
+            message: error instanceof Error ? error.message : String(error),
+            model: slot.model,
+          });
+        },
+        isRetryable: (error) =>
+          error instanceof GeminiHTTPError && error.status === 429,
+      },
+    );
   }
 }

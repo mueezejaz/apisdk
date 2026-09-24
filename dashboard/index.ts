@@ -81,6 +81,7 @@ function publicKey(k: StoredKey) {
     baseUrl:
       k.baseUrl ||
       (provider === 'tokenharbor' ? TOKEN_HARBOR_BASE_URL : undefined),
+    backup: k.backup === true,
     models: k.models,
     enabled: k.enabled,
     createdAt: k.createdAt,
@@ -226,10 +227,22 @@ export async function startDashboard(
         readDefaults(redis),
       ]);
       const errors = await errorLog.getMany(keys.map((k) => k.id));
+      const cooldowns: Record<string, number> = {};
+      await Promise.all(
+        keys.map(async (key) => {
+          try {
+            const until = await keyStore.getCooldownUntil(key.id);
+            if (until) cooldowns[key.id] = until;
+          } catch {
+            // Cooldown status is supplementary; keep the overview available.
+          }
+        }),
+      );
       res.json({
         keys: keys.map(publicKey),
         stats,
         errors,
+        cooldowns,
         defaults: freshDefaults,
       });
     }),
@@ -241,6 +254,11 @@ export async function startDashboard(
       const key = String(req.body?.key ?? '').trim();
       let account = String(req.body?.account ?? '').trim();
       let project = String(req.body?.project ?? '').trim();
+      if (req.body?.backup !== undefined && typeof req.body.backup !== 'boolean') {
+        res.status(400).json({ error: 'backup must be a boolean' });
+        return;
+      }
+      const backup = req.body?.backup === true;
       const models = normalizeModels(req.body?.models);
 
       let provider: Provider;
@@ -293,6 +311,7 @@ export async function startDashboard(
         project,
         provider,
         baseUrl,
+        backup,
         models,
       });
       res.status(201).json(publicKey(entry));
@@ -309,6 +328,7 @@ export async function startDashboard(
         provider,
         baseUrl: requestedBaseUrl,
         baseURL,
+        backup,
         enabled,
         models,
       } = req.body ?? {};
@@ -319,12 +339,18 @@ export async function startDashboard(
         return;
       }
 
+      if (backup !== undefined && typeof backup !== 'boolean') {
+        res.status(400).json({ error: 'backup must be a boolean' });
+        return;
+      }
+
       const patch: {
         key?: string;
         account?: string;
         project?: string;
         provider?: Provider;
         baseUrl?: string;
+        backup?: boolean;
         enabled?: boolean;
         models?: StoredKey['models'];
       } = {};
@@ -332,6 +358,7 @@ export async function startDashboard(
       if (typeof key === 'string') patch.key = key;
       if (typeof account === 'string') patch.account = account;
       if (typeof project === 'string') patch.project = project;
+      if (typeof backup === 'boolean') patch.backup = backup;
       if (typeof enabled === 'boolean') patch.enabled = enabled;
 
       if (provider !== undefined) {

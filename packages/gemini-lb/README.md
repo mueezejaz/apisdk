@@ -26,7 +26,9 @@ integration. The current AI SDK adapter uses the v4 provider interface.
 
 All API keys live in a Redis hash (`gemini-lb:keys`) — no keys in code.
 Keys are organized as **account → project → key → models[]**, with a
-`provider` and optional `baseUrl` on each key.
+`provider`, optional `baseUrl`, and a `backup` role on each key. Backup keys
+are excluded from normal load balancing and are used only when a primary
+request fails.
 
 - **Google Gemini** uses Google's native `generateContent` API.
 - **Token Harbor** uses its OpenAI-compatible Chat Completions API. The
@@ -43,7 +45,9 @@ REDIS_URL=redis://...            # same Redis for everyone
 
 The dashboard can add either provider. Select **Google Gemini** or **Token
 Harbor · OpenAI compatible**, enter the provider-specific base URL, API key,
-and model id. Token Harbor's default base URL is filled in automatically.
+and model id. Token Harbor's default base URL is filled in automatically. A
+key can also be marked **backup**; backup keys are skipped during normal
+load balancing and are tried for the same model after a primary failure.
 
 ## Usage
 
@@ -98,8 +102,12 @@ or vice versa.
 
 - A Lua script atomically claims a **minute slot + daily slot** for the first
   eligible key+model pair under its own limits.
-- On **429**, the slot is released and the request retries with another
-  eligible key+model pair (up to `maxRetries`, default 3).
+- On an upstream failure, the failed key is placed in a shared **20-second
+  cooldown** and its minute slot is released.
+- If a compatible backup key has capacity for the same actual model, the
+  request is sent to that key immediately. Backup selection requires the
+  exact model id; the balancer does not silently substitute another model.
+  Without a compatible backup, 429s continue through normal key retries as before.
 - Every error is recorded in Redis (last 10 per key) for inspection.
 - Deleting a key removes its counters too; changing a key's provider or base
   URL resets that key's usage/error history. Other keys' stats are untouched
@@ -109,7 +117,7 @@ or vice versa.
 
 | Method | Purpose |
 |---|---|
-| `lb.generate(opts)` | Raw Google/Token Harbor call → `{ text, model, keyId, provider, raw }` |
+| `lb.generate(opts)` | Raw Google/Token Harbor call → `{ text, model, keyId, provider, backup, raw }` |
 | `lb(modelId)` / `lb.chat(modelId)` | AI SDK `LanguageModelV4` (`'auto'` supported) |
 | `lb.getStats()` | Per-key per-model usage from Redis |
 | `lb.getRequestLog()` | This process's claim/release/exhausted log |
@@ -124,10 +132,12 @@ or vice versa.
 | `keys` | — | One-time seed (never overwrites Redis) |
 | `defaultProvider` | `'google'` | Provider for seeded raw keys |
 | `defaultBaseUrl` | Token Harbor `/v1` | Base URL for seeded Token Harbor keys |
+| `defaultBackup` | `false` | Mark seeded keys as backup-only |
 | `models` | Gemini defaults, or `['th-orchestra']` for Token Harbor seeds | Fallback models / auto order |
 | `maxPerMinute` / `maxPerDay` | `15` / `500` | Fallback limits for keys without model config |
 | `windowMs` | `60000` | Sliding window |
-| `maxRetries` | `3` | Retries on 429 |
+| `maxRetries` | `3` | Retries on 429 when no backup handles the failure |
+| `cooldownMs` | `20000` | Failed-key quarantine duration |
 | `headers` / `fetch` / `name` | — | Custom headers / fetch / provider name |
 
 For the raw API, Gemini-shaped `safetySettings` and `tools` are not translated

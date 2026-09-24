@@ -7,9 +7,11 @@ import {
 } from './provider-config';
 
 const KEYS_HASH = 'gemini-lb:keys';
+const COOLDOWN_PREFIX = 'gemini-lb:key';
 
 export const DEFAULT_MAX_PER_MINUTE = 15;
 export const DEFAULT_MAX_PER_DAY = 500;
+export const DEFAULT_KEY_COOLDOWN_MS = 20_000;
 
 /** A model configured for one API key, with its own limits. */
 export interface StoredModel {
@@ -33,6 +35,8 @@ export interface StoredKey {
   provider: Provider;
   /** Provider-specific API prefix (required for Token Harbor). */
   baseUrl?: string;
+  /** Backup keys are excluded from normal routing and used after failures. */
+  backup: boolean;
   models: StoredModel[];
   enabled: boolean;
   createdAt: string;
@@ -49,6 +53,8 @@ export interface KeyStoreOptions {
   defaultProvider?: Provider;
   /** Base URL assigned to seeded Token Harbor keys. */
   defaultBaseUrl?: string;
+  /** Whether seeded keys start as backup keys. @default false */
+  defaultBackup?: boolean;
 }
 
 export function maskKey(apiKey: string): string {
@@ -105,6 +111,7 @@ function parseEntry(raw: string): StoredKey | null {
       project: typeof e.project === 'string' ? e.project : '',
       provider,
       baseUrl,
+      backup: e.backup === true,
       models: normalizeModels(e.models),
       enabled: e.enabled !== false,
       createdAt: typeof e.createdAt === 'string' ? e.createdAt : new Date().toISOString(),
@@ -120,7 +127,7 @@ function parseEntry(raw: string): StoredKey | null {
  *
  * Keys live in the Redis hash `gemini-lb:keys`:
  *   field = stable key id (sha256 of the key, first 16 hex chars)
- *   value = JSON { id, key, account, project, provider, baseUrl, models[], enabled, createdAt }
+ *   value = JSON { id, key, account, project, provider, baseUrl, backup, models[], enabled, createdAt }
  *
  * The cache TTL (default 1s) means add/edit/delete from the dashboard
  * is picked up by running providers within ~1 second.
@@ -131,6 +138,7 @@ export class KeyStore {
   private readonly defaultModels: StoredModel[];
   private readonly defaultProvider: Provider;
   private readonly defaultBaseUrl?: string;
+  private readonly defaultBackup: boolean;
   private cache: StoredKey[] | null = null;
   private cacheAt = 0;
 
@@ -139,6 +147,7 @@ export class KeyStore {
     this.cacheTtlMs = options.cacheTtlMs ?? 1000;
     this.defaultModels = options.defaultModels ?? [];
     this.defaultProvider = normalizeProvider(options.defaultProvider);
+    this.defaultBackup = options.defaultBackup === true;
     this.defaultBaseUrl = options.defaultBaseUrl
       ? normalizeBaseUrl(this.defaultProvider, options.defaultBaseUrl)
       : normalizeBaseUrl(this.defaultProvider, undefined);
@@ -154,6 +163,7 @@ export class KeyStore {
           project: '',
           provider: this.defaultProvider,
           baseUrl: this.defaultBaseUrl,
+          backup: this.defaultBackup,
           models: this.defaultModels,
           enabled: true,
           createdAt: new Date().toISOString(),
@@ -186,13 +196,71 @@ export class KeyStore {
     return keys;
   }
 
-  /** Keys eligible for request routing. */
-  async getEnabled(): Promise<StoredKey[]> {
-    return (await this.list()).filter((k) => k.enabled);
+  /**
+   * Keys eligible for routing, excluding keys in cooldown. The default role
+   * keeps the historical `getEnabled()` behavior; the rate limiter explicitly
+   * asks for `normal` or `backup` keys.
+   */
+  async getEnabled(
+    options: { role?: 'all' | 'normal' | 'backup' } = {},
+  ): Promise<StoredKey[]> {
+    const role = options.role ?? 'all';
+    const enabled = (await this.list()).filter((key) => {
+      if (!key.enabled) return false;
+      if (role === 'normal') return !key.backup;
+      if (role === 'backup') return key.backup;
+      return true;
+    });
+    const coolingDown = await this.getCoolingDownIds(enabled.map((key) => key.id));
+    return enabled.filter((key) => !coolingDown.has(key.id));
   }
 
   async get(id: string): Promise<StoredKey | null> {
     return (await this.list()).find((k) => k.id === id) ?? null;
+  }
+
+  /** Put a failed key in a shared, expiring cooldown (20 seconds by default). */
+  async setCooldown(
+    id: string,
+    durationMs: number = DEFAULT_KEY_COOLDOWN_MS,
+  ): Promise<void> {
+    if (!Number.isFinite(durationMs) || durationMs <= 0) {
+      throw new Error('cooldown duration must be a positive number');
+    }
+    const duration = Math.max(1, Math.floor(durationMs));
+    const until = Date.now() + duration;
+    await this.redis.set(this.cooldownKeyFor(id), String(until), 'PX', duration);
+  }
+
+  async clearCooldown(id: string): Promise<void> {
+    await this.redis.del(this.cooldownKeyFor(id));
+  }
+
+  async getCooldownUntil(id: string): Promise<number | undefined> {
+    const raw = await this.redis.get(this.cooldownKeyFor(id));
+    if (!raw) return undefined;
+    const until = Number(raw);
+    return Number.isFinite(until) && until > Date.now() ? until : undefined;
+  }
+
+  cooldownKeyFor(id: string): string {
+    return `${COOLDOWN_PREFIX}:${id}:cooldown`;
+  }
+
+  private async getCoolingDownIds(ids: string[]): Promise<Set<string>> {
+    if (ids.length === 0) return new Set();
+    const mget = (this.redis as Redis & { mget?: (...args: string[]) => Promise<Array<string | null>> }).mget;
+    if (typeof mget !== 'function') return new Set();
+    const values = await mget.call(this.redis, ...ids.map((id) => this.cooldownKeyFor(id)));
+    const cooling = new Set<string>();
+    const now = Date.now();
+    values.forEach((value, index) => {
+      const until = Number(value);
+      if (value !== null && Number.isFinite(until) && until > now) {
+        cooling.add(ids[index]);
+      }
+    });
+    return cooling;
   }
 
   /**
@@ -208,6 +276,7 @@ export class KeyStore {
       baseUrl?: string;
       /** Alias for integrations that use the OpenAI SDK's `baseURL` spelling. */
       baseURL?: string;
+      backup?: boolean;
       label?: never;
     },
   ): Promise<StoredKey> {
@@ -232,6 +301,7 @@ export class KeyStore {
       project: details.project.trim(),
       provider,
       baseUrl,
+      backup: details.backup === true,
       models: normalizeModels(details.models),
       enabled: true,
       createdAt: new Date().toISOString(),
@@ -256,6 +326,7 @@ export class KeyStore {
       provider?: Provider | string;
       baseUrl?: string;
       baseURL?: string;
+      backup?: boolean;
       enabled?: boolean;
       models?: StoredModel[];
     },
@@ -284,6 +355,7 @@ export class KeyStore {
         project: patch.project ?? existing.project,
         provider: nextProvider,
         baseUrl: nextBaseUrl,
+        backup: patch.backup ?? existing.backup,
         models: patch.models ?? existing.models,
       });
       if (patch.enabled === false) {
@@ -294,7 +366,12 @@ export class KeyStore {
       return created;
     }
 
-    const next: StoredKey = { ...existing, provider: nextProvider, baseUrl: nextBaseUrl };
+    const next: StoredKey = {
+      ...existing,
+      provider: nextProvider,
+      baseUrl: nextBaseUrl,
+      backup: patch.backup ?? existing.backup,
+    };
     if (patch.account !== undefined) next.account = patch.account.trim();
     if (patch.project !== undefined) next.project = patch.project.trim();
     if (patch.enabled !== undefined) next.enabled = patch.enabled;

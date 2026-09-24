@@ -139,48 +139,10 @@ export class GeminiLBLanguageModel implements LanguageModelV4 {
   private async executeWithRetry<T>(
     fn: (slot: KeySlot) => Promise<T>,
   ): Promise<T> {
-    const maxRetries = this.keySelector.getRetryLimit();
-    let lastError: unknown;
-    const triedSlots = new Set<string>();
-
-    for (let attempt = 0; attempt <= maxRetries; attempt++) {
-      const slot = triedSlots.size === 0
-        ? await this.keySelector.select(this.modelId)
-        : await this.keySelector.select(this.modelId, triedSlots);
-      if (!slot) {
-        if (lastError) throw lastError;
-        throw new Error(
-          `[gemini-lb] All API keys exhausted for model "${this.modelId}". ` +
-          `Try again later or add more keys.`,
-        );
-      }
-
-      try {
-        return await fn(slot);
-      } catch (error) {
-        triedSlots.add(`${slot.keyId}\u0000${slot.model}`);
-        lastError = error;
-        this.recordError(slot, error);
-        // Release the slot on failure so it can be retried
-        await this.keySelector.release(slot);
-
-        // If it's a 429, try the next key
-        const status = extractStatus(error);
-        const is429 = status === 429;
-
-        if (!is429) {
-          // Non-rate-limit error — don't retry, throw immediately
-          throw error;
-        }
-
-        // If this was the last attempt, throw
-        if (attempt === maxRetries) {
-          throw error;
-        }
-      }
-    }
-
-    throw lastError;
+    return this.keySelector.executeWithFailover(this.modelId, fn, {
+      onFailure: (slot, error) => this.recordError(slot, error),
+      isRetryable: (error) => extractStatus(error) === 429,
+    });
   }
 
   async doGenerate(options: LanguageModelV4CallOptions) {

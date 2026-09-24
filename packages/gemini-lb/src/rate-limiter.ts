@@ -6,60 +6,68 @@ import type { Provider } from './provider-config';
  * Atomically find the first (key, model) candidate that has BOTH a minute
  * and a daily slot free, then claim both in one step.
  *
- * KEYS = [minKey1, dayKey1, dateKey1, minKey2, dayKey2, dateKey2, ...]
+ * KEYS = [minKey1, dayKey1, dateKey1, cooldownKey1, ...]
  * ARGV = [now, windowMs, today, rpm1, dpm1, rpm2, dpm2, ...]
  * Returns: 1-based candidate index, or '0' if all exhausted.
  */
 const RESERVE_SLOT = `
-local n = math.floor(#KEYS / 3)
+local n = math.floor(#KEYS / 4)
 local now = ARGV[1]
 local window_ms = tonumber(ARGV[2])
 local today = ARGV[3]
 
 for i = 0, n - 1 do
-  local minKey = KEYS[3 * i + 1]
-  local dayKey = KEYS[3 * i + 2]
-  local dateKey = KEYS[3 * i + 3]
+  local minKey = KEYS[4 * i + 1]
+  local dayKey = KEYS[4 * i + 2]
+  local dateKey = KEYS[4 * i + 3]
+  local cooldownKey = KEYS[4 * i + 4]
   local rpm = tonumber(ARGV[4 + 2 * i])
   local dpm = tonumber(ARGV[5 + 2 * i])
 
-  -- Trim old entries outside the sliding window
-  local cutoff = tostring(tonumber(now) - window_ms)
-  redis.call('ZREMRANGEBYSCORE', minKey, '-inf', cutoff)
+  -- The cooldown check must be inside the atomic reservation. A pre-read
+  -- from getEnabled() alone can race with a failure in another process.
+  if redis.call('EXISTS', cooldownKey) == 0 then
+    -- Trim old entries outside the sliding window
+    local cutoff = tostring(tonumber(now) - window_ms)
+    redis.call('ZREMRANGEBYSCORE', minKey, '-inf', cutoff)
 
-  -- Roll the daily counter if the date changed
-  if redis.call('GET', dateKey) ~= today then
-    redis.call('SET', dateKey, today)
-    redis.call('SET', dayKey, '0')
-    redis.call('EXPIRE', dateKey, 86400 * 2)
-    redis.call('EXPIRE', dayKey, 86400 * 2)
-  end
+    -- Roll the daily counter if the date changed
+    if redis.call('GET', dateKey) ~= today then
+      redis.call('SET', dateKey, today)
+      redis.call('SET', dayKey, '0')
+      redis.call('EXPIRE', dateKey, 86400 * 2)
+      redis.call('EXPIRE', dayKey, 86400 * 2)
+    end
 
-  local minuteUsed = redis.call('ZCARD', minKey)
-  local dayUsed = tonumber(redis.call('GET', dayKey) or '0')
+    local minuteUsed = redis.call('ZCARD', minKey)
+    local dayUsed = tonumber(redis.call('GET', dayKey) or '0')
 
-  if minuteUsed < rpm and dayUsed < dpm then
-    redis.call('ZADD', minKey, now, now .. ':' .. tostring(math.random(1000000)))
-    redis.call('PEXPIRE', minKey, window_ms + 5000)
-    redis.call('INCR', dayKey)
-    redis.call('EXPIRE', dayKey, 86400 * 2)
-    return tostring(i + 1)
+    if minuteUsed < rpm and dayUsed < dpm then
+      local reservation = now .. ':' .. tostring(math.random(1000000))
+      redis.call('ZADD', minKey, now, reservation)
+      redis.call('PEXPIRE', minKey, window_ms + 5000)
+      redis.call('INCR', dayKey)
+      redis.call('EXPIRE', dayKey, 86400 * 2)
+      return { tostring(i + 1), reservation }
+    end
   end
 end
 
-return '0'
+return { '0', '' }
 `;
 
 const RELEASE_MIN_SLOT = `
-local keys = KEYS
--- Remove the most recent entry (the one we just claimed)
-for i, key in ipairs(keys) do
-  local entries = redis.call('ZREVRANGE', key, 0, 0)
-  if #entries > 0 then
-    redis.call('ZREM', key, entries[1])
-  end
+local key = KEYS[1]
+local reservation = ARGV[1]
+if reservation and reservation ~= '' then
+  return tostring(redis.call('ZREM', key, reservation))
 end
-return '1'
+-- Backwards-compatible fallback for callers that do not have a token.
+local entries = redis.call('ZREVRANGE', key, 0, 0)
+if #entries > 0 then
+  return tostring(redis.call('ZREM', key, entries[1]))
+end
+return '0'
 `;
 
 export interface RateLimiterConfig {
@@ -87,6 +95,10 @@ export interface KeySlot {
   provider: Provider;
   /** Provider-specific API prefix. */
   baseUrl?: string;
+  /** True when this slot came from a backup key. */
+  backup: boolean;
+  /** Exact Redis sorted-set member claimed for this request. */
+  reservationId?: string;
 }
 
 export interface KeyStats {
@@ -96,6 +108,7 @@ export interface KeyStats {
   model: string;
   provider: Provider;
   baseUrl?: string;
+  backup: boolean;
   maxPerMinute: number;
   maxPerDay: number;
   minuteUsed: number;
@@ -110,6 +123,7 @@ export interface RequestLog {
   keyIndex: number;
   maskedKey: string;
   model: string;
+  backup: boolean;
   action: 'claimed' | 'released' | 'exhausted';
 }
 
@@ -163,6 +177,7 @@ export class GeminiRateLimiter {
       keyIndex,
       maskedKey: maskKey(key.key),
       model,
+      backup: key.backup === true,
       action,
     };
     this.requestLog.push(entry);
@@ -207,13 +222,16 @@ export class GeminiRateLimiter {
    * `excludedSlots` contains `${keyId}\\0${model}` pairs already tried by a
    * retry loop. Excluding the pair (rather than just the key) lets `auto`
    * mode try another model on the same key while preventing a 429 retry from
-   * selecting the same key+model again.
+   * selecting the same key+model again. Normal routing excludes backup keys;
+   * pass `role: 'backup'` to select a backup candidate.
    */
   async reserveMinuteSlot(
     requestedModel: string | 'auto',
     excludedSlots: ReadonlySet<string> = new Set(),
+    options: { role?: 'normal' | 'backup' } = {},
   ): Promise<KeySlot | null> {
-    const enabled = await this.keyStore.getEnabled();
+    const role = options.role ?? 'normal';
+    const enabled = await this.keyStore.getEnabled({ role });
     if (enabled.length === 0) return null;
 
     const now = Date.now().toString();
@@ -236,6 +254,7 @@ export class GeminiRateLimiter {
           this.minKey(c.key.id, model),
           this.dayKey(c.key.id, model),
           this.dayDateKey(c.key.id, model),
+          this.keyStore.cooldownKeyFor(c.key.id),
         );
         argv.push(
           c.model.maxPerMinute.toString(),
@@ -248,9 +267,12 @@ export class GeminiRateLimiter {
         redisKeys.length,
         ...redisKeys,
         ...argv,
-      )) as string;
+      )) as string | string[];
 
-      const idx = parseInt(result, 10);
+      const idx = Array.isArray(result)
+        ? parseInt(result[0] ?? '0', 10)
+        : parseInt(result, 10);
+      const reservationId = Array.isArray(result) ? result[1] : undefined;
       if (idx > 0) {
         const c = candidates[idx - 1];
         const keyIndex = enabled.indexOf(c.key);
@@ -262,6 +284,8 @@ export class GeminiRateLimiter {
           model,
           provider: c.key.provider ?? 'google',
           baseUrl: c.key.baseUrl,
+          backup: c.key.backup === true,
+          reservationId,
         };
       }
     }
@@ -281,14 +305,23 @@ export class GeminiRateLimiter {
   /**
    * Release a minute slot on 429 (the request failed).
    */
-  async releaseOnFailure(keyId: string, model: string): Promise<void> {
+  async releaseOnFailure(
+    keyId: string,
+    model: string,
+    reservationId?: string,
+  ): Promise<void> {
     const key = this.minKey(keyId, model);
-    await this.redis.eval(RELEASE_MIN_SLOT, 1, key);
+    await this.redis.eval(RELEASE_MIN_SLOT, 1, key, reservationId ?? '');
     const enabled = await this.keyStore.getEnabled();
     const index = enabled.findIndex((k) => k.id === keyId);
     if (index >= 0) {
       this.log(enabled[index], index, model, 'released');
     }
+  }
+
+  /** Put a failed key in a shared cooldown window. */
+  async cooldown(keyId: string, durationMs?: number): Promise<void> {
+    await this.keyStore.setCooldown(keyId, durationMs);
   }
 
   /**
@@ -317,6 +350,7 @@ export class GeminiRateLimiter {
           model: m.id,
           provider: key.provider ?? 'google',
           baseUrl: key.baseUrl,
+          backup: key.backup === true,
           maxPerMinute: m.maxPerMinute,
           maxPerDay: m.maxPerDay,
           minuteUsed: minCount,
