@@ -12,6 +12,11 @@ import { GeminiRateLimiter, KeyStats, RequestLog } from './rate-limiter';
 import { KeySelector } from './key-selector';
 import { GeminiLBLanguageModel } from './gemini-lb-language-model';
 import { GeminiRawClient, RawGenerateOptions, RawGenerateResult } from './raw';
+import {
+  normalizeBaseUrl,
+  normalizeProvider,
+  type Provider,
+} from './provider-config';
 
 export interface GeminiLBProviderSettings {
   /**
@@ -20,6 +25,12 @@ export interface GeminiLBProviderSettings {
    * directly; this option becomes optional.
    */
   keys?: string[];
+
+  /** Provider assigned to seeded keys when no per-key metadata is available. @default 'google' */
+  defaultProvider?: Provider;
+
+  /** Base URL assigned to seeded Token Harbor keys. @default Token Harbor /v1 */
+  defaultBaseUrl?: string;
 
   /**
    * Redis connection URL or instance. Keys and rate-limit state live here.
@@ -30,7 +41,7 @@ export interface GeminiLBProviderSettings {
   /**
    * Fallback models (also used to seed keys and order 'auto' mode).
    * Each key's own model config in Redis takes priority.
-   * @default ['gemini-3.1-flash-lite', 'gemini-3.5-flash-lite']
+   * @default Google models, or ['th-orchestra'] when defaultProvider is Token Harbor
    */
   models?: string[];
 
@@ -79,10 +90,11 @@ export interface GeminiLBProvider extends ProviderV4 {
   (modelId: string): GeminiLBLanguageModel;
   languageModel(modelId: string): GeminiLBLanguageModel;
   chat(modelId: string): GeminiLBLanguageModel;
+  chatModel(modelId: string): GeminiLBLanguageModel;
 
   /**
-   * Direct Gemini API call (no AI SDK needed): picks a key+model slot,
-   * calls generateContent, releases the slot and retries on 429.
+   * Direct provider API call (no AI SDK needed): picks a key+model slot,
+   * calls Google Gemini or Token Harbor, releases the slot and retries on 429.
    *
    *   const res = await lb.generate({ prompt: 'Hi' });   // model: 'auto'
    *   res.text; res.model; res.keyId; res.raw;
@@ -113,10 +125,12 @@ export function createGeminiLB(
     ownRedis = conn.owned;
   }
 
-  const defaultModelIds = settings.models ?? [
-    'gemini-3.1-flash-lite',
-    'gemini-3.5-flash-lite',
-  ];
+  const defaultProvider = normalizeProvider(settings.defaultProvider);
+  const defaultModelIds =
+    settings.models ??
+    (defaultProvider === 'tokenharbor'
+      ? ['th-orchestra']
+      : ['gemini-3.1-flash-lite', 'gemini-3.5-flash-lite']);
   const maxPerMinute = settings.maxPerMinute ?? DEFAULT_MAX_PER_MINUTE;
   const maxPerDay = settings.maxPerDay ?? DEFAULT_MAX_PER_DAY;
 
@@ -126,9 +140,12 @@ export function createGeminiLB(
     maxPerDay,
   }));
 
+  const defaultBaseUrl = normalizeBaseUrl(defaultProvider, settings.defaultBaseUrl);
   const keyStore = new KeyStore(redis, {
     initialKeys: settings.keys,
     defaultModels: fallbackModels,
+    defaultProvider,
+    defaultBaseUrl,
   });
   const errorLog = new KeyErrorLog(redis);
 
@@ -172,8 +189,16 @@ export function createGeminiLB(
     return createModel(modelId);
   } as GeminiLBProvider;
 
+  Object.assign(provider, { specificationVersion: 'v4' as const });
   provider.languageModel = createModel;
   provider.chat = createModel;
+  provider.chatModel = createModel;
+  provider.embeddingModel = () => {
+    throw new Error('gemini-lb does not provide embedding models');
+  };
+  provider.imageModel = () => {
+    throw new Error('gemini-lb does not provide image models');
+  };
   provider.generate = (options) => rawClient.generate(options);
   provider.getStats = () => rateLimiter.getStats();
   provider.getRequestLog = () => rateLimiter.getRequestLog();

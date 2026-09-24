@@ -13,6 +13,6 @@
       "gemini-lb": ["./packages/gemini-lb/src/index.ts"]
     }
   },
-  "include": ["dashboard/**/*", "test/**/*"],
+  "include": ["dashboard/**/*", "scripts/**/*", "test/**/*"],
   "exclude": ["node_modules", "dist", "packages", "test/result.ts"]
 }

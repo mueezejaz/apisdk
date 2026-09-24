@@ -8,7 +8,7 @@ async function main() {
       handle.host === '0.0.0.0' || handle.host === '::'
         ? `http://localhost:${handle.port}`
         : `http://${handle.host}:${handle.port}`;
-    console.log(`\n  📊 Gemini LB dashboard → ${url}\n`);
+    console.log(`\n  📊 AI LB dashboard → ${url}\n`);
 
     const shutdown = async () => {
       console.log('\nShutting down…');

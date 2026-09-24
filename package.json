@@ -8,6 +8,7 @@
   ],
   "scripts": {
     "dashboard": "tsx dashboard/main.ts",
+    "test:tokenharbor": "tsx scripts/token-harbor-smoke.ts",
     "typecheck": "tsc --noEmit && npm run typecheck --workspaces --if-present",
     "build": "npm run build --workspaces --if-present",
     "test": "echo \"Error: no test specified\" && exit 1"

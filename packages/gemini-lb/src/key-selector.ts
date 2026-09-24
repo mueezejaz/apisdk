@@ -16,10 +16,15 @@ export class KeySelector {
 
   /**
    * Select the best key+model slot. On failure, retries with other keys.
-   * Returns null if all keys are exhausted.
+   * Returns null if all eligible slots are exhausted.
    */
-  async select(model: string | 'auto'): Promise<KeySlot | null> {
-    return this.rateLimiter.reserveMinuteSlot(model);
+  async select(
+    model: string | 'auto',
+    excludedSlots?: ReadonlySet<string>,
+  ): Promise<KeySlot | null> {
+    return excludedSlots === undefined
+      ? this.rateLimiter.reserveMinuteSlot(model)
+      : this.rateLimiter.reserveMinuteSlot(model, excludedSlots);
   }
 
   /**

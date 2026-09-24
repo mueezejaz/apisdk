@@ -12,6 +12,10 @@ import {
   KeyErrorLog,
   GeminiRateLimiter,
   type StoredKey,
+  normalizeProvider,
+  normalizeBaseUrl,
+  TOKEN_HARBOR_BASE_URL,
+  type Provider,
 } from 'gemini-lb';
 import { DASHBOARD_HTML } from './html';
 
@@ -53,8 +57,8 @@ const DEFAULT_LIMITS: Defaults = {
 const TOKEN_TTL_MS = 24 * 60 * 60 * 1000;
 
 /**
- * Read the provider's published defaults (createGeminiLB writes it on startup).
- * Used to prefill the add-key form and as fallback limits for seeded keys.
+ * Read published dashboard defaults when available. The fallback keeps the
+ * dashboard useful even when no provider process has written a config yet.
  */
 async function readDefaults(redis: Redis): Promise<Defaults> {
   try {
@@ -67,15 +71,40 @@ async function readDefaults(redis: Redis): Promise<Defaults> {
 }
 
 function publicKey(k: StoredKey) {
+  const provider = k.provider ?? 'google';
   return {
     id: k.id,
     masked: maskKey(k.key),
     account: k.account,
     project: k.project,
+    provider,
+    baseUrl:
+      k.baseUrl ||
+      (provider === 'tokenharbor' ? TOKEN_HARBOR_BASE_URL : undefined),
     models: k.models,
     enabled: k.enabled,
     createdAt: k.createdAt,
   };
+}
+
+function providerFromRequest(value: unknown): Provider {
+  try {
+    return normalizeProvider(value);
+  } catch (error) {
+    throw new Error(error instanceof Error ? error.message : String(error));
+  }
+}
+
+/** Catch the most common dashboard mistake before sending a key to the wrong API. */
+function providerKeyMismatch(provider: Provider, key: string): string | undefined {
+  const normalized = key.trim().toLowerCase();
+  if (provider === 'google' && normalized.startsWith('thk_')) {
+    return 'This looks like a Token Harbor key. Select the Token Harbor provider instead of Google Gemini.';
+  }
+  if (provider === 'tokenharbor' && normalized.startsWith('aiza')) {
+    return 'This looks like a Google Gemini key. Select the Google Gemini provider instead of Token Harbor.';
+  }
+  return undefined;
 }
 
 /** Wrap async handlers so rejections reach the error middleware (Express 5-friendly). */
@@ -210,9 +239,37 @@ export async function startDashboard(
     '/api/keys',
     h(async (req, res) => {
       const key = String(req.body?.key ?? '').trim();
-      const account = String(req.body?.account ?? '').trim();
-      const project = String(req.body?.project ?? '').trim();
+      let account = String(req.body?.account ?? '').trim();
+      let project = String(req.body?.project ?? '').trim();
       const models = normalizeModels(req.body?.models);
+
+      let provider: Provider;
+      let baseUrl: string | undefined;
+      try {
+        provider = providerFromRequest(req.body?.provider);
+        baseUrl = normalizeBaseUrl(
+          provider,
+          req.body?.baseUrl ?? req.body?.baseURL,
+        );
+      } catch (error) {
+        res.status(400).json({
+          error: error instanceof Error ? error.message : String(error),
+        });
+        return;
+      }
+
+      // Token Harbor universal keys do not have a vendor account/project;
+      // give those entries useful dashboard labels when the fields are blank.
+      if (provider === 'tokenharbor') {
+        account ||= 'Token Harbor';
+        project ||= 'Universal';
+      }
+
+      const keyMismatch = providerKeyMismatch(provider, key);
+      if (keyMismatch) {
+        res.status(400).json({ error: keyMismatch });
+        return;
+      }
 
       if (!account) {
         res.status(400).json({ error: 'account is required' });
@@ -231,7 +288,13 @@ export async function startDashboard(
         return;
       }
 
-      const entry = await keyStore.add(key, { account, project, models });
+      const entry = await keyStore.add(key, {
+        account,
+        project,
+        provider,
+        baseUrl,
+        models,
+      });
       res.status(201).json(publicKey(entry));
     }),
   );
@@ -239,18 +302,85 @@ export async function startDashboard(
   app.patch(
     '/api/keys/:id',
     h(async (req, res) => {
-      const { key, account, project, enabled, models } = req.body ?? {};
+      const {
+        key,
+        account,
+        project,
+        provider,
+        baseUrl: requestedBaseUrl,
+        baseURL,
+        enabled,
+        models,
+      } = req.body ?? {};
+      const id = String(req.params.id);
+      const existing = await keyStore.get(id);
+      if (!existing) {
+        res.status(404).json({ error: 'key not found' });
+        return;
+      }
+
       const patch: {
         key?: string;
         account?: string;
         project?: string;
+        provider?: Provider;
+        baseUrl?: string;
         enabled?: boolean;
         models?: StoredKey['models'];
       } = {};
+
       if (typeof key === 'string') patch.key = key;
       if (typeof account === 'string') patch.account = account;
       if (typeof project === 'string') patch.project = project;
       if (typeof enabled === 'boolean') patch.enabled = enabled;
+
+      if (provider !== undefined) {
+        try {
+          patch.provider = providerFromRequest(provider);
+        } catch (error) {
+          res.status(400).json({
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return;
+        }
+      }
+
+      const suppliedBaseUrl = requestedBaseUrl ?? baseURL;
+      if (suppliedBaseUrl !== undefined) {
+        if (typeof suppliedBaseUrl !== 'string') {
+          res.status(400).json({ error: 'base URL must be a string' });
+          return;
+        }
+        try {
+          patch.baseUrl = normalizeBaseUrl(
+            patch.provider ?? existing.provider,
+            suppliedBaseUrl,
+          );
+        } catch (error) {
+          res.status(400).json({
+            error: error instanceof Error ? error.message : String(error),
+          });
+          return;
+        }
+      }
+
+      const effectiveProvider = patch.provider ?? existing.provider;
+      if (typeof key === 'string') {
+        const keyMismatch = providerKeyMismatch(effectiveProvider, key);
+        if (keyMismatch) {
+          res.status(400).json({ error: keyMismatch });
+          return;
+        }
+      }
+      if (effectiveProvider === 'tokenharbor') {
+        if (patch.account !== undefined && !patch.account.trim()) {
+          patch.account = 'Token Harbor';
+        }
+        if (patch.project !== undefined && !patch.project.trim()) {
+          patch.project = 'Universal';
+        }
+      }
+
       if (models !== undefined) {
         const normalized = normalizeModels(models);
         if (normalized.length === 0) {
@@ -273,7 +403,7 @@ export async function startDashboard(
         return;
       }
 
-      const updated = await keyStore.update(String(req.params.id), patch);
+      const updated = await keyStore.update(id, patch);
       if (!updated) {
         res.status(404).json({ error: 'key not found' });
         return;

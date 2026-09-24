@@ -1,5 +1,10 @@
 import { createHash } from 'crypto';
 import Redis from 'ioredis';
+import {
+  normalizeBaseUrl,
+  normalizeProvider,
+  type Provider,
+} from './provider-config';
 
 const KEYS_HASH = 'gemini-lb:keys';
 
@@ -24,6 +29,10 @@ export interface StoredKey {
   key: string;
   account: string;
   project: string;
+  /** Upstream API provider. Legacy entries default to Google Gemini. */
+  provider: Provider;
+  /** Provider-specific API prefix (required for Token Harbor). */
+  baseUrl?: string;
   models: StoredModel[];
   enabled: boolean;
   createdAt: string;
@@ -36,6 +45,10 @@ export interface KeyStoreOptions {
   initialKeys?: string[];
   /** Models assigned to seeded keys (and used as display fallback). */
   defaultModels?: StoredModel[];
+  /** Provider assigned to seeded/legacy keys. @default 'google' */
+  defaultProvider?: Provider;
+  /** Base URL assigned to seeded Token Harbor keys. */
+  defaultBaseUrl?: string;
 }
 
 export function maskKey(apiKey: string): string {
@@ -71,11 +84,27 @@ function parseEntry(raw: string): StoredKey | null {
   try {
     const e = JSON.parse(raw);
     if (!e || typeof e.id !== 'string' || typeof e.key !== 'string') return null;
+    let provider: Provider;
+    try {
+      provider = normalizeProvider(e.provider);
+    } catch {
+      // Keep entries from older/custom writers usable as Google keys.
+      provider = 'google';
+    }
+    let baseUrl: string | undefined;
+    try {
+      baseUrl = normalizeBaseUrl(provider, e.baseUrl);
+    } catch {
+      // Keep a legacy/corrupt entry usable with the provider default.
+      baseUrl = undefined;
+    }
     return {
       id: e.id,
       key: e.key,
       account: typeof e.account === 'string' ? e.account : '',
       project: typeof e.project === 'string' ? e.project : '',
+      provider,
+      baseUrl,
       models: normalizeModels(e.models),
       enabled: e.enabled !== false,
       createdAt: typeof e.createdAt === 'string' ? e.createdAt : new Date().toISOString(),
@@ -91,7 +120,7 @@ function parseEntry(raw: string): StoredKey | null {
  *
  * Keys live in the Redis hash `gemini-lb:keys`:
  *   field = stable key id (sha256 of the key, first 16 hex chars)
- *   value = JSON { id, key, account, project, models[], enabled, createdAt }
+ *   value = JSON { id, key, account, project, provider, baseUrl, models[], enabled, createdAt }
  *
  * The cache TTL (default 1s) means add/edit/delete from the dashboard
  * is picked up by running providers within ~1 second.
@@ -100,6 +129,8 @@ export class KeyStore {
   private readonly redis: Redis;
   private readonly cacheTtlMs: number;
   private readonly defaultModels: StoredModel[];
+  private readonly defaultProvider: Provider;
+  private readonly defaultBaseUrl?: string;
   private cache: StoredKey[] | null = null;
   private cacheAt = 0;
 
@@ -107,6 +138,10 @@ export class KeyStore {
     this.redis = redis;
     this.cacheTtlMs = options.cacheTtlMs ?? 1000;
     this.defaultModels = options.defaultModels ?? [];
+    this.defaultProvider = normalizeProvider(options.defaultProvider);
+    this.defaultBaseUrl = options.defaultBaseUrl
+      ? normalizeBaseUrl(this.defaultProvider, options.defaultBaseUrl)
+      : normalizeBaseUrl(this.defaultProvider, undefined);
 
     if (options.initialKeys?.length) {
       const seeded = options.initialKeys
@@ -117,6 +152,8 @@ export class KeyStore {
           key: k,
           account: '',
           project: '',
+          provider: this.defaultProvider,
+          baseUrl: this.defaultBaseUrl,
           models: this.defaultModels,
           enabled: true,
           createdAt: new Date().toISOString(),
@@ -167,12 +204,23 @@ export class KeyStore {
       account: string;
       project: string;
       models: StoredModel[];
+      provider?: Provider | string;
+      baseUrl?: string;
+      /** Alias for integrations that use the OpenAI SDK's `baseURL` spelling. */
+      baseURL?: string;
       label?: never;
     },
   ): Promise<StoredKey> {
     const trimmed = apiKey.trim();
     if (!trimmed) throw new Error('API key is empty');
 
+    const provider = normalizeProvider(details.provider ?? this.defaultProvider);
+    const suppliedBaseUrl = details.baseUrl ?? details.baseURL;
+    const baseUrl = normalizeBaseUrl(
+      provider,
+      suppliedBaseUrl ??
+        (provider === this.defaultProvider ? this.defaultBaseUrl : undefined),
+    );
     const id = keyId(trimmed);
     const existing = await this.get(id);
     if (existing) return existing;
@@ -182,6 +230,8 @@ export class KeyStore {
       key: trimmed,
       account: details.account.trim(),
       project: details.project.trim(),
+      provider,
+      baseUrl,
       models: normalizeModels(details.models),
       enabled: true,
       createdAt: new Date().toISOString(),
@@ -203,6 +253,9 @@ export class KeyStore {
       key?: string;
       account?: string;
       project?: string;
+      provider?: Provider | string;
+      baseUrl?: string;
+      baseURL?: string;
       enabled?: boolean;
       models?: StoredModel[];
     },
@@ -210,12 +263,27 @@ export class KeyStore {
     const existing = await this.get(id);
     if (!existing) return null;
 
+    const currentProvider = normalizeProvider(existing.provider);
+    const nextProvider =
+      patch.provider !== undefined
+        ? normalizeProvider(patch.provider)
+        : currentProvider;
+    const suppliedBaseUrl = patch.baseUrl ?? patch.baseURL;
+    const nextBaseUrl =
+      suppliedBaseUrl !== undefined
+        ? normalizeBaseUrl(nextProvider, suppliedBaseUrl)
+        : patch.provider !== undefined && nextProvider !== currentProvider
+          ? normalizeBaseUrl(nextProvider, undefined)
+          : existing.baseUrl;
+
     if (patch.key !== undefined && patch.key.trim() && patch.key.trim() !== existing.key) {
       // Rotation = remove old identity, add the new one (keeps account/project/models).
       await this.remove(id);
       const created = await this.add(patch.key, {
         account: patch.account ?? existing.account,
         project: patch.project ?? existing.project,
+        provider: nextProvider,
+        baseUrl: nextBaseUrl,
         models: patch.models ?? existing.models,
       });
       if (patch.enabled === false) {
@@ -226,12 +294,17 @@ export class KeyStore {
       return created;
     }
 
-    const next: StoredKey = { ...existing };
+    const next: StoredKey = { ...existing, provider: nextProvider, baseUrl: nextBaseUrl };
     if (patch.account !== undefined) next.account = patch.account.trim();
     if (patch.project !== undefined) next.project = patch.project.trim();
     if (patch.enabled !== undefined) next.enabled = patch.enabled;
     if (patch.models !== undefined) next.models = normalizeModels(patch.models);
 
+    if (nextProvider !== currentProvider || nextBaseUrl !== existing.baseUrl) {
+      // Provider/base URL changes alter the upstream and should not carry
+      // usage or error history from the previous endpoint.
+      await this.cleanupCounters(id);
+    }
     await this.redis.hset(KEYS_HASH, id, JSON.stringify(next));
     this.invalidate();
     return next;

@@ -3,7 +3,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Gemini LB — Key Dashboard</title>
+<title>AI LB — Key Dashboard</title>
 <style>
   :root {
     --bg: #0d1117; --panel: #161b22; --border: #30363d;
@@ -29,12 +29,15 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
   button.primary:hover { background: #2ea043; }
   button.danger:hover { border-color: var(--red); color: var(--red); }
   button.ghost { background: transparent; border-style: dashed; }
-  input[type=text], input[type=password], input[type=number] {
+  input[type=text], input[type=password], input[type=number], input[type=url], select {
     background: var(--bg); color: var(--text); border: 1px solid var(--border);
     border-radius: 6px; padding: 8px 10px; font-size: 13px; width: 100%;
   }
-  input:focus { outline: none; border-color: var(--accent); }
+  input:focus, select:focus { outline: none; border-color: var(--accent); }
   input[type=number] { -moz-appearance: textfield; }
+  select { cursor: pointer; }
+  .field-hint { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .provider-fields { margin-bottom: 8px; }
   .panel { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin-bottom: 16px; }
   .panel-title { font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin-bottom: 10px; }
   .grid3 { display: grid; grid-template-columns: 1fr 1fr 2fr; gap: 8px; margin-bottom: 8px; }
@@ -58,6 +61,12 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
   .key-id { font-family: ui-monospace, "Cascadia Code", Consolas, monospace; font-size: 13px; }
   .acct-chip { background: #1f6feb33; color: var(--accent); border-radius: 10px; padding: 1px 9px; font-size: 12px; }
   .proj-chip { background: #30363d; color: var(--muted); border-radius: 10px; padding: 1px 9px; font-size: 12px; }
+  .provider-chip { background: #8957e533; color: #d2a8ff; border-radius: 10px; padding: 1px 9px; font-size: 12px; }
+  .provider-chip.google { background: #1f6feb33; color: var(--accent); }
+  .base-url-chip {
+    max-width: 280px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    font-family: ui-monospace, Consolas, monospace; font-size: 11px; color: var(--muted);
+  }
   .spacer { flex: 1; }
   .err-badge { background: #f8514922; color: var(--red); border: 1px solid #f8514955; border-radius: 10px; padding: 1px 9px; font-size: 12px; cursor: pointer; }
   .err-badge.none { background: transparent; color: var(--muted); border-color: var(--border); cursor: default; }
@@ -101,7 +110,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
   .login-box .row { display: grid; gap: 10px; }
   .login-error { color: var(--red); font-size: 12px; min-height: 16px; text-align: center; }
   @media (max-width: 720px) {
-    .grid3, .grid2 { grid-template-columns: 1fr; }
+    .grid3, .grid2, .provider-fields { grid-template-columns: 1fr; }
     .model-row { grid-template-columns: 1fr 80px 80px 32px; }
     .usage-row { grid-template-columns: 1fr; }
   }
@@ -110,7 +119,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
 <body>
 <div id="login-overlay">
   <div class="login-box">
-    <h2>🔐 Gemini LB Dashboard</h2>
+    <h2>🔐 AI LB Dashboard</h2>
     <form class="row" id="login-form">
       <input type="password" id="login-password" placeholder="Dashboard password" autocomplete="current-password">
       <div class="login-error" id="login-error"></div>
@@ -121,7 +130,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
 
 <div class="wrap">
   <header>
-    <h1>Gemini <span>LB</span> · API Key Dashboard</h1>
+    <h1>AI <span>LB</span> · API Key Dashboard</h1>
     <div style="display:flex;gap:10px;align-items:center">
       <span class="muted" id="updated"></span>
       <button id="logout-btn" style="display:none">Logout</button>
@@ -134,6 +143,17 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
       <div class="grid3">
         <input type="text" id="add-account" placeholder="Account name *" autocomplete="off">
         <input type="text" id="add-project" placeholder="Project name *" autocomplete="off">
+        <select id="add-provider" aria-label="API provider">
+          <option value="google">Google Gemini</option>
+          <option value="tokenharbor">Token Harbor · OpenAI compatible</option>
+        </select>
+      </div>
+
+      <div class="grid2 provider-fields">
+        <div>
+          <input type="url" id="add-base-url" placeholder="https://tokenharbor.ai/v1" value="https://generativelanguage.googleapis.com/v1beta" autocomplete="off">
+          <div class="field-hint" id="base-url-hint">Google Gemini base URL</div>
+        </div>
         <input type="text" id="add-key" placeholder="AIza… API key *" autocomplete="off">
       </div>
 
@@ -166,6 +186,89 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
   var openErrors = {};
   var authed = false;
   var defaults = null; // { models: [...], maxPerMinute, maxPerDay, windowMs }
+  var addProvider = "google";
+  var GOOGLE_BASE_URL = "https://generativelanguage.googleapis.com/v1beta";
+  var TOKEN_HARBOR_BASE_URL = "https://tokenharbor.ai/v1";
+
+  function providerLabel(provider) {
+    return provider === "tokenharbor"
+      ? "Token Harbor · OpenAI compatible"
+      : "Google Gemini";
+  }
+
+  function providerOptions(selected) {
+    return '<option value="google"' + (selected === "google" ? " selected" : "") + '>Google Gemini</option>' +
+      '<option value="tokenharbor"' + (selected === "tokenharbor" ? " selected" : "") + '>Token Harbor · OpenAI compatible</option>';
+  }
+
+  function defaultBaseUrl(provider) {
+    return provider === "tokenharbor" ? TOKEN_HARBOR_BASE_URL : GOOGLE_BASE_URL;
+  }
+
+  function suggestedModel(provider) {
+    if (provider === "tokenharbor") return "th-orchestra";
+    return defaults && defaults.models && defaults.models[0]
+      ? defaults.models[0]
+      : "gemini-3.1-flash-lite";
+  }
+
+  function detectProviderFromKey(value) {
+    var key = value.trim();
+    if (/^thk_/i.test(key) && addProvider !== "tokenharbor") {
+      setAddProvider("tokenharbor");
+      toast("Token Harbor key detected — provider switched automatically", false);
+    } else if (/^aiza/i.test(key) && addProvider !== "google") {
+      setAddProvider("google");
+      toast("Google Gemini key detected — provider switched automatically", false);
+    }
+  }
+
+  function setAddProvider(provider) {
+    var previousProvider = addProvider;
+    addProvider = provider === "tokenharbor" ? "tokenharbor" : "google";
+    var select = document.getElementById("add-provider");
+    var baseInput = document.getElementById("add-base-url");
+    var baseHint = document.getElementById("base-url-hint");
+    var keyInput = document.getElementById("add-key");
+    var accountInput = document.getElementById("add-account");
+    var projectInput = document.getElementById("add-project");
+    if (select) select.value = addProvider;
+    if (accountInput) {
+      accountInput.placeholder = addProvider === "tokenharbor"
+        ? "Account name (optional)"
+        : "Account name *";
+    }
+    if (projectInput) {
+      projectInput.placeholder = addProvider === "tokenharbor"
+        ? "Project name (optional)"
+        : "Project name *";
+    }
+
+    var previousDefault = addProvider === "tokenharbor"
+      ? GOOGLE_BASE_URL
+      : TOKEN_HARBOR_BASE_URL;
+    if (baseInput && (!baseInput.value.trim() || baseInput.value.trim() === previousDefault)) {
+      baseInput.value = defaultBaseUrl(addProvider);
+    }
+    if (baseHint) {
+      baseHint.textContent = addProvider === "tokenharbor"
+        ? "OpenAI-compatible gateway · default /v1 · models from /v1/models"
+        : "Google Gemini base URL";
+    }
+    if (keyInput) {
+      keyInput.placeholder = addProvider === "tokenharbor"
+        ? "thk_live_… API key *"
+        : "AIza… API key *";
+    }
+
+    var modelInput = document.querySelector("#add-models .m-id");
+    if (modelInput) {
+      var current = modelInput.value.trim();
+      if (!current || current === suggestedModel(previousProvider) || current === "th-orchestra" || current === "gemini-3.1-flash-lite") {
+        modelInput.value = suggestedModel(addProvider);
+      }
+    }
+  }
 
   function esc(s) {
     return String(s == null ? "" : s).replace(/[&<>"']/g, function (c) {
@@ -210,14 +313,17 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
 
   // ── Model rows (shared by add form and edit box) ─────────────────
 
-  function makeModelRow(container, modelId, rpm, dpm) {
+  function makeModelRow(container, modelId, rpm, dpm, provider) {
     var row = document.createElement("div");
     row.className = "model-row";
 
+    var rowProvider = provider || addProvider;
     var idInput = document.createElement("input");
     idInput.type = "text";
     idInput.className = "m-id";
-    idInput.placeholder = "e.g. gemini-3.1-flash-lite";
+    idInput.placeholder = rowProvider === "tokenharbor"
+      ? "e.g. th-orchestra"
+      : "e.g. gemini-3.1-flash-lite";
     idInput.value = modelId || "";
     idInput.setAttribute("autocomplete", "off");
 
@@ -274,10 +380,9 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
   function fillAddDefaults() {
     var box = document.getElementById("add-models");
     if (box.children.length > 0 || !defaults) return;
-    var suggested = defaults.models && defaults.models[0]
-      ? [{ id: defaults.models[0], rpm: defaults.maxPerMinute, dpm: defaults.maxPerDay }]
-      : [{ id: "", rpm: 15, dpm: 500 }];
-    makeModelRow(box, suggested[0].id, suggested[0].rpm, suggested[0].dpm);
+    var rpm = defaults.maxPerMinute || 15;
+    var dpm = defaults.maxPerDay || 500;
+    makeModelRow(box, suggestedModel(addProvider), rpm, dpm, addProvider);
   }
 
   // ── Rendering ─────────────────────────────────────────────────────
@@ -307,10 +412,16 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
   }
 
   function editBoxHtml(k) {
+    var provider = k.provider || "google";
+    var baseUrl = k.baseUrl || defaultBaseUrl(provider);
     var h = '<div class="editbox">';
     h += '<div class="grid2">' +
       '<input type="text" class="ed-account" placeholder="account" value="' + esc(k.account) + '">' +
       '<input type="text" class="ed-project" placeholder="project" value="' + esc(k.project) + '">' +
+      '</div>';
+    h += '<div class="grid2" style="margin-top:8px">' +
+      '<select class="ed-provider" aria-label="API provider">' + providerOptions(provider) + '</select>' +
+      '<input type="url" class="ed-base-url" placeholder="Base URL" value="' + esc(baseUrl) + '" autocomplete="off">' +
       '</div>';
     h += '<div style="margin-top:8px"><input type="text" class="ed-key" placeholder="rotate key — leave blank to keep current" autocomplete="off"></div>';
     h += '<div class="models-box" style="margin-top:8px">' +
@@ -334,8 +445,13 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
 
     h += '<div class="card-head">';
     h += '<span class="key-id">' + esc(k.masked) + '</span>';
+    h += '<span class="provider-chip ' + (k.provider === "tokenharbor" ? "tokenharbor" : "google") + '">' +
+      esc(providerLabel(k.provider || "google")) + '</span>';
     if (k.account) h += '<span class="acct-chip">' + esc(k.account) + '</span>';
     if (k.project) h += '<span class="proj-chip">' + esc(k.project) + '</span>';
+    if (k.baseUrl) {
+      h += '<span class="base-url-chip" title="' + esc(k.baseUrl) + '">' + esc(k.baseUrl) + '</span>';
+    }
     h += '<span class="muted">' + k.models.length + ' model' + (k.models.length === 1 ? "" : "s") + ' · added ' + new Date(k.createdAt).toLocaleDateString() + '</span>';
     h += '<span class="spacer"></span>';
 
@@ -383,6 +499,7 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
 
   function render(data) {
     defaults = data.defaults || defaults;
+    setAddProvider(addProvider);
 
     var byKey = {};
     (data.stats || []).forEach(function (s) {
@@ -426,7 +543,14 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
         if (act === "cancel") handler = function () { editingId = null; refresh(true); };
         if (act === "errs") handler = function () { openErrors[id] = !openErrors[id]; refresh(true); };
         if (act === "ed-add-model") handler = function () {
-          makeModelRow(card.querySelector(".ed-models"), "", null, null);
+          var editingKey = data_key(id);
+          makeModelRow(
+            card.querySelector(".ed-models"),
+            "",
+            null,
+            null,
+            editingKey ? editingKey.provider : addProvider,
+          );
         };
         if (act === "toggle") handler = function () {
           req("/api/keys/" + id, { method: "PATCH", body: JSON.stringify({ enabled: elm.checked }) })
@@ -442,12 +566,19 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
         if (act === "save") handler = function () {
           var account = card.querySelector(".ed-account").value.trim();
           var project = card.querySelector(".ed-project").value.trim();
+          var provider = card.querySelector(".ed-provider").value;
+          var baseUrl = card.querySelector(".ed-base-url").value.trim();
           var models = collectModels(card.querySelector(".ed-models"));
+          if (provider === "tokenharbor") {
+            account ||= "Token Harbor";
+            project ||= "Universal";
+          }
           if (!account) { toast("Account is required", true); return; }
           if (!project) { toast("Project is required", true); return; }
+          if (!baseUrl) { toast("Base URL is required", true); return; }
           if (models.length === 0) { toast("At least one model with an ID is required", true); return; }
 
-          var patch = { account: account, project: project, models: models };
+          var patch = { account: account, project: project, provider: provider, baseUrl: baseUrl, models: models };
           var newKey = card.querySelector(".ed-key").value.trim();
           if (newKey) patch.key = newKey;
 
@@ -467,10 +598,46 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
         var key = data_key(id);
         if (box && box.children.length === 0 && key) {
           key.models.forEach(function (m) {
-            makeModelRow(box, m.id, m.maxPerMinute, m.maxPerDay);
+            makeModelRow(box, m.id, m.maxPerMinute, m.maxPerDay, key.provider);
           });
-          if (key.models.length === 0) makeModelRow(box, "", null, null);
+          if (key.models.length === 0) makeModelRow(box, "", null, null, key.provider);
         }
+
+        var providerSelect = card.querySelector(".ed-provider");
+        var baseInput = card.querySelector(".ed-base-url");
+        if (providerSelect && baseInput) {
+          providerSelect.addEventListener("change", function () {
+            var nextProvider = providerSelect.value;
+            var previousDefault = nextProvider === "tokenharbor"
+              ? GOOGLE_BASE_URL
+              : TOKEN_HARBOR_BASE_URL;
+            if (!baseInput.value.trim() || baseInput.value.trim() === previousDefault) {
+              baseInput.value = defaultBaseUrl(nextProvider);
+            }
+          });
+        }
+
+        var rotateInput = card.querySelector(".ed-key");
+        if (rotateInput && providerSelect) {
+          rotateInput.addEventListener("input", function () {
+            var value = rotateInput.value.trim();
+            var detected = /^thk_/i.test(value)
+              ? "tokenharbor"
+              : /^aiza/i.test(value)
+                ? "google"
+                : null;
+            if (detected && detected !== providerSelect.value) {
+              providerSelect.value = detected;
+              providerSelect.dispatchEvent(new Event("change"));
+              toast(
+                (detected === "tokenharbor" ? "Token Harbor" : "Google Gemini") +
+                  " key detected — provider switched automatically",
+                false,
+              );
+            }
+          });
+        }
+
         var first = card.querySelector(".ed-account");
         if (first) first.focus();
       }
@@ -529,26 +696,50 @@ export const DASHBOARD_HTML = `<!DOCTYPE html>
     showLogin();
   });
 
+  document.getElementById("add-provider").addEventListener("change", function () {
+    setAddProvider(this.value);
+  });
+
+  document.getElementById("add-key").addEventListener("input", function () {
+    detectProviderFromKey(this.value);
+  });
+
+  setAddProvider("google");
+
   document.getElementById("add-model-btn").addEventListener("click", function () {
-    makeModelRow(document.getElementById("add-models"), "", null, null);
+    makeModelRow(document.getElementById("add-models"), "", null, null, addProvider);
   });
 
   document.getElementById("add-form").addEventListener("submit", async function (ev) {
     ev.preventDefault();
     var account = document.getElementById("add-account").value.trim();
     var project = document.getElementById("add-project").value.trim();
+    var provider = document.getElementById("add-provider").value;
+    var baseUrl = document.getElementById("add-base-url").value.trim();
     var key = document.getElementById("add-key").value.trim();
     var models = collectModels(document.getElementById("add-models"));
 
+    if (provider === "tokenharbor") {
+      account ||= "Token Harbor";
+      project ||= "Universal";
+    }
     if (!account) { toast("Account name is required", true); return; }
     if (!project) { toast("Project name is required", true); return; }
+    if (!baseUrl) { toast("Base URL is required", true); return; }
     if (!key) { toast("API key is required", true); return; }
     if (models.length === 0) { toast("At least one model with an ID is required", true); return; }
 
     try {
       await req("/api/keys", {
         method: "POST",
-        body: JSON.stringify({ account: account, project: project, key: key, models: models })
+        body: JSON.stringify({
+          account: account,
+          project: project,
+          provider: provider,
+          baseUrl: baseUrl,
+          key: key,
+          models: models
+        })
       });
       document.getElementById("add-key").value = "";
       toast("Key added");

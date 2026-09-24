@@ -26,6 +26,16 @@ export {
   type KeyStoreOptions,
 } from './key-store';
 export { KeyErrorLog, type KeyErrorEntry } from './error-log';
+export {
+  PROVIDERS,
+  PROVIDER_LABELS,
+  GOOGLE_BASE_URL,
+  TOKEN_HARBOR_BASE_URL,
+  normalizeProvider,
+  normalizeBaseUrl,
+  joinBaseUrl,
+  type Provider,
+} from './provider-config';
 export { createRedis, type RedisConnection } from './redis';
 export {
   GeminiRawClient,

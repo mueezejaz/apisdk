@@ -1,7 +1,11 @@
 import { KeySelector } from './key-selector';
 import { KeyErrorLog } from './error-log';
-
-const API_BASE = 'https://generativelanguage.googleapis.com/v1beta/models';
+import {
+  GOOGLE_BASE_URL,
+  TOKEN_HARBOR_BASE_URL,
+  joinBaseUrl,
+  type Provider,
+} from './provider-config';
 
 export interface RawGenerateOptions {
   prompt: string;
@@ -9,9 +13,11 @@ export interface RawGenerateOptions {
   model?: string;
   /** System instruction text. */
   system?: string;
-  /** Gemini generationConfig (temperature, maxOutputTokens, …). */
+  /** Generation settings. Gemini names are mapped for OpenAI-compatible providers. */
   generationConfig?: Record<string, unknown>;
+  /** Gemini safety settings; ignored by OpenAI-compatible providers. */
   safetySettings?: unknown[];
+  /** Provider-specific tools. For Token Harbor use OpenAI's `tools` shape. */
   tools?: unknown[];
   /** Extra fields merged into the request body (advanced). */
   body?: Record<string, unknown>;
@@ -24,7 +30,9 @@ export interface RawGenerateResult {
   model: string;
   /** Stable key id that served the request. */
   keyId: string;
-  /** Full Gemini API response. */
+  /** Upstream provider that served the request. */
+  provider: Provider;
+  /** Full provider API response. */
   raw: Record<string, unknown>;
 }
 
@@ -40,17 +48,31 @@ export class GeminiHTTPError extends Error {
 
 function cleanHeaders(
   headers?: Record<string, string | undefined>,
+  blocked: string[] = [],
 ): Record<string, string> {
+  const blockedNames = new Set(blocked.map((name) => name.toLowerCase()));
   const out: Record<string, string> = {};
   if (headers) {
     for (const [k, v] of Object.entries(headers)) {
-      if (v !== undefined) out[k] = v;
+      if (v !== undefined && !blockedNames.has(k.toLowerCase())) out[k] = v;
     }
   }
   return out;
 }
 
-function extractText(raw: Record<string, unknown>): string {
+function extractText(raw: Record<string, unknown>, provider: Provider): string {
+  if (provider === 'tokenharbor') {
+    const message = (raw?.choices as any[] | undefined)?.[0]?.message;
+    const content = message?.content;
+    if (typeof content === 'string') return content;
+    if (Array.isArray(content)) {
+      return content
+        .map((part) => (typeof part?.text === 'string' ? part.text : ''))
+        .join('');
+    }
+    return '';
+  }
+
   const candidates = raw?.candidates as any[] | undefined;
   const parts = candidates?.[0]?.content?.parts;
   if (!Array.isArray(parts)) return '';
@@ -59,11 +81,63 @@ function extractText(raw: Record<string, unknown>): string {
     .join('');
 }
 
+function buildGeminiBody(options: RawGenerateOptions): Record<string, unknown> {
+  return {
+    contents: [{ role: 'user', parts: [{ text: options.prompt }] }],
+    ...(options.system
+      ? { systemInstruction: { parts: [{ text: options.system }] } }
+      : {}),
+    ...(options.generationConfig
+      ? { generationConfig: options.generationConfig }
+      : {}),
+    ...(options.safetySettings ? { safetySettings: options.safetySettings } : {}),
+    ...(options.tools ? { tools: options.tools } : {}),
+    ...options.body,
+  };
+}
+
+function buildOpenAICompatibleBody(options: RawGenerateOptions): Record<string, unknown> {
+  const config = options.generationConfig ?? {};
+  const mapped: Record<string, unknown> = {};
+  const copy = (target: string, ...sources: string[]) => {
+    for (const source of sources) {
+      if (config[source] !== undefined) {
+        mapped[target] = config[source];
+        return;
+      }
+    }
+  };
+
+  // Accept both OpenAI names and the Gemini-style names used by the existing
+  // raw API. Explicit `body` values win below (streaming is not supported by
+  // this raw helper, so it always remains disabled).
+  copy('temperature', 'temperature');
+  copy('top_p', 'top_p', 'topP');
+  copy('max_tokens', 'max_tokens', 'maxTokens', 'maxOutputTokens');
+  copy('stop', 'stop', 'stopSequences');
+  copy('presence_penalty', 'presence_penalty', 'presencePenalty');
+  copy('frequency_penalty', 'frequency_penalty', 'frequencyPenalty');
+  copy('seed', 'seed');
+  copy('response_format', 'response_format', 'responseFormat');
+
+  return {
+    model: options.model && options.model !== 'auto' ? options.model : undefined,
+    messages: [
+      ...(options.system ? [{ role: 'system', content: options.system }] : []),
+      { role: 'user', content: options.prompt },
+    ],
+    ...mapped,
+    ...(options.tools ? { tools: options.tools } : {}),
+    ...options.body,
+    stream: false,
+  };
+}
+
 /**
- * Direct Gemini REST client (no Vercel AI SDK required) that goes through
- * the same key selection / rate limiting / error tracking as the AI SDK
- * provider: picks a key+model slot, calls generateContent, releases the
- * slot and retries on 429 with another key.
+ * Direct REST client for Google Gemini and OpenAI-compatible Token Harbor
+ * keys. It goes through the same key selection, rate limiting, and error
+ * tracking as the AI SDK provider: picks a key+model slot, calls the selected
+ * provider, releases the slot, and retries on 429 with another eligible slot.
  */
 export class GeminiRawClient {
   private readonly keySelector: KeySelector;
@@ -90,10 +164,14 @@ export class GeminiRawClient {
   async generate(options: RawGenerateOptions): Promise<RawGenerateResult> {
     const requestedModel = options.model ?? 'auto';
     let lastError: unknown;
+    const triedSlots = new Set<string>();
 
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
-      const slot = await this.keySelector.select(requestedModel);
+      const slot = triedSlots.size === 0
+        ? await this.keySelector.select(requestedModel)
+        : await this.keySelector.select(requestedModel, triedSlots);
       if (!slot) {
+        if (lastError) throw lastError;
         throw new Error(
           `[gemini-lb] All API keys exhausted for model "${requestedModel}". ` +
             `Try again later or add more keys.`,
@@ -102,27 +180,34 @@ export class GeminiRawClient {
 
       try {
         const doFetch = this.fetch ?? globalThis.fetch;
-        const url = `${API_BASE}/${encodeURIComponent(slot.model)}:generateContent`;
+        const isTokenHarbor = slot.provider === 'tokenharbor';
+        const baseUrl = slot.baseUrl ?? (isTokenHarbor ? TOKEN_HARBOR_BASE_URL : GOOGLE_BASE_URL);
+        const url = isTokenHarbor
+          ? joinBaseUrl(baseUrl, '/chat/completions')
+          : joinBaseUrl(
+              baseUrl,
+              `/models/${encodeURIComponent(slot.model)}:generateContent`,
+            );
+        const body = isTokenHarbor
+          ? {
+              ...buildOpenAICompatibleBody(options),
+              // `auto` is resolved by the slot, never sent to the gateway.
+              model: slot.model,
+            }
+          : buildGeminiBody(options);
 
-        const body: Record<string, unknown> = {
-          contents: [{ role: 'user', parts: [{ text: options.prompt }] }],
-          ...(options.system
-            ? { systemInstruction: { parts: [{ text: options.system }] } }
-            : {}),
-          ...(options.generationConfig
-            ? { generationConfig: options.generationConfig }
-            : {}),
-          ...(options.safetySettings ? { safetySettings: options.safetySettings } : {}),
-          ...(options.tools ? { tools: options.tools } : {}),
-          ...options.body,
-        };
-
+        const providerHeaders = isTokenHarbor
+          ? { Authorization: `Bearer ${slot.apiKey}` }
+          : { 'x-goog-api-key': slot.apiKey };
         const res = await doFetch(url, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            'x-goog-api-key': slot.apiKey,
-            ...cleanHeaders(this.defaultHeaders),
+            ...providerHeaders,
+            ...cleanHeaders(
+              this.defaultHeaders,
+              isTokenHarbor ? ['authorization'] : ['x-goog-api-key'],
+            ),
           },
           body: JSON.stringify(body),
         });
@@ -140,12 +225,14 @@ export class GeminiRawClient {
 
         const raw = (await res.json()) as Record<string, unknown>;
         return {
-          text: extractText(raw),
+          text: extractText(raw, slot.provider),
           model: slot.model,
           keyId: slot.keyId,
+          provider: slot.provider ?? 'google',
           raw,
         };
       } catch (error) {
+        triedSlots.add(`${slot.keyId}\u0000${slot.model}`);
         lastError = error;
         // Fire-and-forget (record() never throws)
         void this.errorLog?.record(slot.keyId, {

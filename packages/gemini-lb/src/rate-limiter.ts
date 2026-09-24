@@ -1,5 +1,6 @@
 import Redis from 'ioredis';
 import { KeyStore, StoredKey, StoredModel, maskKey } from './key-store';
+import type { Provider } from './provider-config';
 
 /**
  * Atomically find the first (key, model) candidate that has BOTH a minute
@@ -82,6 +83,10 @@ export interface KeySlot {
   keyIndex: number;
   apiKey: string;
   model: string;
+  /** Upstream provider selected for this slot. */
+  provider: Provider;
+  /** Provider-specific API prefix. */
+  baseUrl?: string;
 }
 
 export interface KeyStats {
@@ -89,6 +94,8 @@ export interface KeyStats {
   keyIndex: number;
   maskedKey: string;
   model: string;
+  provider: Provider;
+  baseUrl?: string;
   maxPerMinute: number;
   maxPerDay: number;
   minuteUsed: number;
@@ -196,8 +203,16 @@ export class GeminiRateLimiter {
   /**
    * Atomically find a key+model with capacity (per-model limits) and claim
    * both the minute and daily slot. Returns null if all keys are exhausted.
+   *
+   * `excludedSlots` contains `${keyId}\\0${model}` pairs already tried by a
+   * retry loop. Excluding the pair (rather than just the key) lets `auto`
+   * mode try another model on the same key while preventing a 429 retry from
+   * selecting the same key+model again.
    */
-  async reserveMinuteSlot(requestedModel: string | 'auto'): Promise<KeySlot | null> {
+  async reserveMinuteSlot(
+    requestedModel: string | 'auto',
+    excludedSlots: ReadonlySet<string> = new Set(),
+  ): Promise<KeySlot | null> {
     const enabled = await this.keyStore.getEnabled();
     if (enabled.length === 0) return null;
 
@@ -208,7 +223,9 @@ export class GeminiRateLimiter {
       requestedModel === 'auto' ? this.autoModelOrder(enabled) : [requestedModel];
 
     for (const model of modelOrder) {
-      const candidates = this.candidatesFor(enabled, model);
+      const candidates = this.candidatesFor(enabled, model).filter(
+        (candidate) => !excludedSlots.has(`${candidate.key.id}\u0000${model}`),
+      );
       if (candidates.length === 0) continue;
 
       const redisKeys: string[] = [];
@@ -243,14 +260,18 @@ export class GeminiRateLimiter {
           keyIndex,
           apiKey: c.key.key,
           model,
+          provider: c.key.provider ?? 'google',
+          baseUrl: c.key.baseUrl,
         };
       }
     }
 
-    // Log exhaustion for every configured (key, model) pair
+    // Log exhaustion for configured (key, model) pairs not already tried.
     for (let i = 0; i < enabled.length; i++) {
       for (const m of this.modelsFor(enabled[i])) {
-        this.log(enabled[i], i, m.id, 'exhausted');
+        if (!excludedSlots.has(`${enabled[i].id}\u0000${m.id}`)) {
+          this.log(enabled[i], i, m.id, 'exhausted');
+        }
       }
     }
 
@@ -294,6 +315,8 @@ export class GeminiRateLimiter {
           keyIndex: i,
           maskedKey: maskKey(key.key),
           model: m.id,
+          provider: key.provider ?? 'google',
+          baseUrl: key.baseUrl,
           maxPerMinute: m.maxPerMinute,
           maxPerDay: m.maxPerDay,
           minuteUsed: minCount,

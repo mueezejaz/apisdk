@@ -1,4 +1,5 @@
-test/
+test/*
+!test/chat.ts
 node_modules/
 .env
 dist/
